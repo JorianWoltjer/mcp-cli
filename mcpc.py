@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 from base64 import b64decode
+# import codecs
 import mimetypes
 import traceback
-from sseclient import SSEClient
+# from sseclient import SSEClient
 from urllib.parse import urljoin
 from pathlib import Path
 import requests
@@ -11,14 +12,38 @@ import tempfile
 import json
 
 
+class SSE:
+    def __init__(self, url, **kwargs):
+        self.url = url
+        r = requests.get(url, stream=True, **kwargs)
+        self.iter = r.iter_lines()
+
+    def __next__(self):
+        while True:
+            name, value = next(self.iter).split(b": ", 1)
+            if name == b"" and "ping" in value:
+                assert next(self.iter) == b""
+                continue
+
+            if name == b"event":
+                event = value.decode("utf-8")
+                name, value = next(self.iter).split(b": ", 1)
+                assert name == b"data"
+                data = value.decode("utf-8")
+                assert next(self.iter) == b""
+                return event, data
+
+
 class MCP:
-    def __init__(self, host: str, timeout: int = 3):
+    def __init__(self, host: str, timeout: int = 5):
         print(f"=== {host} ===")
         self.host = host
-        self.sse = SSEClient(host + '/sse', timeout=timeout)
-        response = next(self.sse)
-        assert response.event == "endpoint", f"Received {response.dump().strip()!r}"
-        self.messages_url = urljoin(self.host, response.data)
+        self.sse = SSE(host + '/sse', timeout=timeout)
+        # self.sse.decoder = codecs.getincrementaldecoder(
+        #     "utf-8")(errors='replace')
+        event, data = next(self.sse)
+        assert event == "endpoint", f"Received {(event, data)}"
+        self.messages_url = urljoin(self.host, data)
 
         # https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle/#initialization
         response = self.jsonrpc("initialize", {
@@ -34,6 +59,7 @@ class MCP:
                 "version": "1.0.0"
             }
         })
+        self.server_info = response["serverInfo"]
         print("Name:", repr(response["serverInfo"]["name"]))
 
         self.jsonrpc("notifications/initialized", notification=True)
@@ -55,7 +81,12 @@ class MCP:
         assert r.ok, r.text
 
         if not notification:  # notifications don't have a response
-            data = json.loads(next(self.sse).data)
+            try:
+                event, data = next(self.sse)
+                data = json.loads(data)
+            except json.JSONDecodeError as e:
+                print("JSON:", repr(data))
+                raise
             if 'error' in data:
                 raise ValueError(data["error"])
             if 'result' not in data:
@@ -179,7 +210,7 @@ if __name__ == "__main__":
                         help="Arguments for the tool call in JSON format")
     parser.add_argument("-r", "--raw", action="store_true",
                         help="Print raw JSON response")
-    parser.add_argument("-t", "--timeout", type=int, default=3,
+    parser.add_argument("-t", "--timeout", type=int, default=5,
                         help="Timeout for requests in seconds")
 
     args = parser.parse_args()
@@ -247,8 +278,7 @@ if __name__ == "__main__":
                     print(json.dumps(prompts, indent=4))
                 else:
                     for i, prompt in enumerate(prompts, 1):
-                        arguments = {arg['name']
-                            : "" for arg in prompt['arguments']}
+                        arguments = {arg['name']: "" for arg in prompt['arguments']}
                         command = f"prompt/{prompt['name']} '{json.dumps(arguments)}'"
                         line1 = prompt["description"] if prompt.get(
                             'description') else command
@@ -258,6 +288,7 @@ if __name__ == "__main__":
                             print(f"      {line2}")
                 all_results.append({
                     "host": host,
+                    "server_info": mcp.server_info,
                     "success": True,
                     "tools": tools,
                     "resources": resources,
