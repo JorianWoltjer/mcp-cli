@@ -12,12 +12,12 @@ import json
 
 
 class MCP:
-    def __init__(self, host: str):
+    def __init__(self, host: str, timeout: int = 3):
         print(f"=== {host} ===")
         self.host = host
-        self.sse = SSEClient(host + '/sse', timeout=5)
+        self.sse = SSEClient(host + '/sse', timeout=timeout)
         response = next(self.sse)
-        assert response.event == "endpoint", response.dump()
+        assert response.event == "endpoint", f"Received {response.dump().strip()!r}"
         self.messages_url = urljoin(self.host, response.data)
 
         # https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle/#initialization
@@ -58,22 +58,50 @@ class MCP:
             data = json.loads(next(self.sse).data)
             if 'error' in data:
                 raise ValueError(data["error"])
+            if 'result' not in data:
+                raise ValueError(f"No result in {data}")
             return data["result"]
 
     def list_tools(self):
         """
         https://spec.modelcontextprotocol.io/specification/2024-11-05/server/tools/#listing-tools
         """
-        return self.jsonrpc("tools/list")["tools"]
+        try:
+            return self.jsonrpc("tools/list")["tools"]
+        except ValueError as e:
+            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
+                return []  # Server does not support tools
+            raise
+
+    def list_resource_templates(self):
+        try:
+            return self.jsonrpc("resources/templates/list")["resourceTemplates"]
+        except ValueError as e:
+            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
+                return []  # Server does not support resource templates
+            raise
 
     def list_resources(self):
         """
         https://modelcontextprotocol.io/specification/2024-11-05/server/resources#listing-resources
         """
-        return self.jsonrpc("resources/list")["resources"] + \
-            self.jsonrpc("resources/templates/list")["resourceTemplates"]
+        try:
+            return self.jsonrpc("resources/list")["resources"] + self.list_resource_templates()
+        except ValueError as e:
+            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
+                return []  # Server does not support resources
+            raise
 
-    # TODO: https://modelcontextprotocol.io/specification/2025-03-26/server/prompts
+    def list_prompts(self):
+        """
+        https://modelcontextprotocol.io/specification/2025-03-26/server/prompts/#listing-prompts
+        """
+        try:
+            return self.jsonrpc("prompts/list")["prompts"]
+        except ValueError as e:
+            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
+                return []  # Server does not support resources
+            raise
 
     def call_tool(self, name, arguments):
         """
@@ -91,6 +119,15 @@ class MCP:
         return self.jsonrpc("resources/read", {
             "uri": uri
         })["contents"]
+
+    def get_prompt(self, name, arguments):
+        """
+        https://modelcontextprotocol.io/specification/2025-03-26/server/prompts/#getting-prompts
+        """
+        return self.jsonrpc("prompts/get", {
+            "name": name,
+            "arguments": arguments
+        })["messages"]
 
     def tool_call_example(arguments, result=None):
         if not "type" in arguments:
@@ -142,6 +179,8 @@ if __name__ == "__main__":
                         help="Arguments for the tool call in JSON format")
     parser.add_argument("-r", "--raw", action="store_true",
                         help="Print raw JSON response")
+    parser.add_argument("-t", "--timeout", type=int, default=3,
+                        help="Timeout for requests in seconds")
 
     args = parser.parse_args()
 
@@ -150,24 +189,26 @@ if __name__ == "__main__":
     else:
         hosts = [args.host]
 
+    all_results = []
     for host in hosts:
         if not host.startswith("http"):
             host = "http://" + host
 
         if not args.name_or_uri:
-            # List tools
+            # List tools/resources/prompts
             results = []
             try:
-                mcp = MCP(host)
+                mcp = MCP(host, timeout=args.timeout)
                 tools = mcp.list_tools()
                 resources = mcp.list_resources()
+                prompts = mcp.list_prompts()
                 print("-> Tools:")
                 if args.raw:
                     print(json.dumps(tools, indent=4))
                 else:
                     for i, tool in enumerate(tools, 1):
-                        example = MCP.tool_call_example(tool['inputSchema'])
-                        command = f"{tool['name']} '{json.dumps(example)}'"
+                        arguments = MCP.tool_call_example(tool['inputSchema'])
+                        command = f"{tool['name']} '{json.dumps(arguments)}'"
                         line1 = tool.get('description', command)
                         line2 = command if 'description' in tool else None
                         print(f" {i:>3}. {line1}")
@@ -201,25 +242,37 @@ if __name__ == "__main__":
                         print(f" {i:>3}. {line1}")
                         if line2 is not None:
                             print(f"      {line2}")
-                results.append({
+                print("-> Prompts:")
+                if args.raw:
+                    print(json.dumps(prompts, indent=4))
+                else:
+                    for i, prompt in enumerate(prompts, 1):
+                        arguments = {arg['name']
+                            : "" for arg in prompt['arguments']}
+                        command = f"prompt/{prompt['name']} '{json.dumps(arguments)}'"
+                        line1 = prompt["description"] if prompt.get(
+                            'description') else command
+                        line2 = command if prompt.get("description") else None
+                        print(f" {i:>3}. {line1}")
+                        if line2 is not None:
+                            print(f"      {line2}")
+                all_results.append({
                     "host": host,
                     "success": True,
-                    "tools": tools
+                    "tools": tools,
+                    "resources": resources,
+                    "prompts": prompts
                 })
             except Exception as e:
                 traceback.print_exc()
-                results.append({
+                all_results.append({
                     "host": host,
                     "success": False,
                     "error": str(e)
                 })
             print()
-
-            if args.output:
-                json.dump(results, args.output.open("w"), indent=4)
-                print(f"Results written to {args.output}")
         else:
-            mcp = MCP(host)
+            mcp = MCP(host, timeout=args.timeout)
             if "://" in args.name_or_uri:
                 # Fetch resource
                 result = mcp.get_resource(args.name_or_uri)
@@ -243,11 +296,43 @@ if __name__ == "__main__":
                         else:
                             raise ValueError(
                                 f"Unsupported resource: {content}")
-
-                if args.output:
-                    with args.output.open("w") as f:
-                        json.dump(result, f, indent=4)
-                    print(f"Results written to {args.output}")
+            elif args.name_or_uri.startswith("prompt/"):
+                # Get prompt
+                result = mcp.get_prompt(args.name_or_uri[7:],
+                                        json.loads(args.args or "{}"))
+                print()
+                if args.raw:
+                    print("-> Result:")
+                    print(json.dumps(result, indent=4))
+                else:
+                    print("-> Result:")
+                    for message in result:
+                        content = message["content"]
+                        if content["type"] == "text":
+                            content_s = content["text"]
+                        elif content["type"] == "image" or content["type"] == "audio":
+                            extension = mimetypes.guess_extension(
+                                content["mimeType"])
+                            with open(tempfile.mktemp(suffix=extension), "wb") as f:
+                                f.write(b64decode(content["data"]))
+                            content_s = f"<{f.name}>"
+                        elif content["type"] == "resource":
+                            resource = content["resource"]
+                            if 'text' in resource:
+                                content_s = resource["text"]
+                            elif 'blob' in resource:
+                                extension = mimetypes.guess_extension(
+                                    resource["mimeType"])
+                                with open(tempfile.mktemp(suffix=extension), "wb") as f:
+                                    data = resource.get(
+                                        "text", b64decode(resource["blob"]))
+                                    f.write(b64decode(data))
+                                content_s = f"<{f.name}>"
+                            else:
+                                content_s = f"<{resource['uri']}>"
+                        else:
+                            raise NotImplementedError
+                        print(f"{message['role']}: {content_s}")
             else:
                 # Call tool
                 result = mcp.call_tool(args.name_or_uri,
@@ -260,14 +345,35 @@ if __name__ == "__main__":
                     print("-> Result:")
                     for content in result:
                         if content["type"] == "text":
-                            print(f"{content['text']}")
+                            print(content['text'])
                         elif content["type"] == "image" or content["type"] == "audio":
                             extension = mimetypes.guess_extension(
                                 content["mimeType"])
                             with open(tempfile.mktemp(suffix=extension), "wb") as f:
                                 f.write(b64decode(content["data"]))
                             print(f"File content saved to {f.name}")
-                if args.output:
-                    with args.output.open("w") as f:
-                        json.dump(result, f, indent=4)
-                    print(f"Results written to {args.output}")
+                        elif content["type"] == "resource":
+                            resource = content["resource"]
+                            if 'text' in resource:
+                                print(resource["text"])
+                            elif 'blob' in resource:
+                                extension = mimetypes.guess_extension(
+                                    resource["mimeType"])
+                                with open(tempfile.mktemp(suffix=extension), "wb") as f:
+                                    data = resource.get(
+                                        "text", b64decode(resource["blob"]))
+                                    f.write(b64decode(data))
+                                print(f"Resource content saved to {f.name}")
+                            else:
+                                print("Resource:", resource['uri'])
+                        else:
+                            raise NotImplementedError
+
+            if args.output:
+                with args.output.open("w") as f:
+                    json.dump(result, f, indent=4)
+                print(f"Results written to {args.output}")
+
+    if args.output:
+        json.dump(all_results, args.output.open("w"), indent=4)
+        print(f"Results written to {args.output}")
