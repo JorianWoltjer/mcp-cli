@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 from base64 import b64decode
-# import codecs
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mimetypes
 import traceback
-# from sseclient import SSEClient
 from urllib.parse import urljoin
 from pathlib import Path
 import requests
@@ -20,7 +19,10 @@ class SSE:
 
     def __next__(self):
         while True:
-            name, value = next(self.iter).split(b": ", 1)
+            line = next(self.iter).split(b": ", 1)
+            if len(line) == 1:
+                raise ValueError(f"Missing colon separator: {line!r}")
+            name, value = line
             if name == b"" and "ping" in value:
                 assert next(self.iter) == b""
                 continue
@@ -35,8 +37,7 @@ class SSE:
 
 
 class MCP:
-    def __init__(self, host: str, timeout: int = 5):
-        print(f"=== {host} ===")
+    def __init__(self, host: str, timeout: int = 10):
         self.host = host
         self.sse = SSE(host + '/sse', timeout=timeout)
         # self.sse.decoder = codecs.getincrementaldecoder(
@@ -60,7 +61,6 @@ class MCP:
             }
         })
         self.server_info = response["serverInfo"]
-        print("Name:", repr(response["serverInfo"]["name"]))
 
         self.jsonrpc("notifications/initialized", notification=True)
 
@@ -166,6 +166,8 @@ class MCP:
                 return MCP.tool_call_example(arguments["anyOf"][0])
             else:
                 return None
+        if isinstance(arguments["type"], list):
+            arguments["type"] = arguments["type"][0]
 
         if arguments["type"] == "string":
             result = ""
@@ -193,6 +195,32 @@ class MCP:
         return result
 
 
+def get_mcp_info(host):
+    """
+    Get MCP server information.
+    """
+    try:
+        mcp = MCP(host)
+        tools = mcp.list_tools()
+        resources = mcp.list_resources()
+        prompts = mcp.list_prompts()
+        return {
+            "host": host,
+            "server_info": mcp.server_info,
+            "success": True,
+            "tools": tools,
+            "resources": resources,
+            "prompts": prompts
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "host": host,
+            "success": False,
+            "error": str(e)
+        }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Interact with a Model Context Protocol server")
@@ -210,8 +238,10 @@ if __name__ == "__main__":
                         help="Arguments for the tool call in JSON format")
     parser.add_argument("-r", "--raw", action="store_true",
                         help="Print raw JSON response")
-    parser.add_argument("-t", "--timeout", type=int, default=5,
+    parser.add_argument("-t", "--timeout", type=int, default=10,
                         help="Timeout for requests in seconds")
+    parser.add_argument("-T", "--threads", type=int, default=10,
+                        help="Number of threads to use for concurrent requests")
 
     args = parser.parse_args()
 
@@ -219,21 +249,28 @@ if __name__ == "__main__":
         hosts = args.file.read_text().splitlines()
     else:
         hosts = [args.host]
+    hosts = ["http://" +
+             host if not host.startswith("http") else host for host in hosts]
 
-    all_results = []
-    for host in hosts:
-        if not host.startswith("http"):
-            host = "http://" + host
+    if not args.name_or_uri:
+        # List tools/resources/prompts
+        all_results = []
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            future_to_host = {executor.submit(
+                get_mcp_info, host): host for host in hosts}
 
-        if not args.name_or_uri:
-            # List tools/resources/prompts
-            results = []
-            try:
-                mcp = MCP(host, timeout=args.timeout)
-                tools = mcp.list_tools()
-                resources = mcp.list_resources()
-                prompts = mcp.list_prompts()
+            for future in as_completed(future_to_host):
+                host = future_to_host[future]
+                data = future.result()
+                all_results.append(data)
+                print(f"=== {host} ===")
+                if not data["success"]:
+                    print("Error:", data["error"])
+                    continue
+
+                print("Name:", repr(data["server_info"]["name"]))
                 print("-> Tools:")
+                tools = data["tools"]
                 if args.raw:
                     print(json.dumps(tools, indent=4))
                 else:
@@ -246,6 +283,7 @@ if __name__ == "__main__":
                         if line2 is not None:
                             print(f"      {line2}")
                 print("-> Resources:")
+                resources = data["resources"]
                 if args.raw:
                     print(json.dumps(resources, indent=4))
                 else:
@@ -274,11 +312,13 @@ if __name__ == "__main__":
                         if line2 is not None:
                             print(f"      {line2}")
                 print("-> Prompts:")
+                prompts = data["prompts"]
                 if args.raw:
                     print(json.dumps(prompts, indent=4))
                 else:
                     for i, prompt in enumerate(prompts, 1):
-                        arguments = {arg['name']: "" for arg in prompt['arguments']}
+                        arguments = {
+                            arg['name']: "" for arg in prompt.get('arguments', [])}
                         command = f"prompt/{prompt['name']} '{json.dumps(arguments)}'"
                         line1 = prompt["description"] if prompt.get(
                             'description') else command
@@ -286,125 +326,112 @@ if __name__ == "__main__":
                         print(f" {i:>3}. {line1}")
                         if line2 is not None:
                             print(f"      {line2}")
-                all_results.append({
-                    "host": host,
-                    "server_info": mcp.server_info,
-                    "success": True,
-                    "tools": tools,
-                    "resources": resources,
-                    "prompts": prompts
-                })
-            except Exception as e:
-                traceback.print_exc()
-                all_results.append({
-                    "host": host,
-                    "success": False,
-                    "error": str(e)
-                })
-            print()
-        else:
-            mcp = MCP(host, timeout=args.timeout)
-            if "://" in args.name_or_uri:
-                # Fetch resource
-                result = mcp.get_resource(args.name_or_uri)
                 print()
-                if args.raw:
-                    print("-> Result:")
-                    print(json.dumps(result, indent=4))
-                else:
-                    print("-> Result:")
-                    for content in result:
+
+        if args.output:
+            with args.output.open("w") as f:
+                json.dump(all_results, f, indent=4)
+            print(f"Results written to {args.output}")
+    else:
+        # Call tool/prompt/resource
+        mcp = MCP(args.host, timeout=args.timeout)
+        if "://" in args.name_or_uri:
+            # Fetch resource
+            result = mcp.get_resource(args.name_or_uri)
+            print()
+            if args.raw:
+                print("-> Result:")
+                print(json.dumps(result, indent=4))
+            else:
+                print("-> Result:")
+                for content in result:
+                    extension = mimetypes.guess_extension(
+                        content["mimeType"])
+                    if 'blob' in content:
+                        with open(tempfile.mktemp(suffix=extension), "wb") as f:
+                            data = content.get(
+                                "text", b64decode(content["blob"]))
+                            f.write(b64decode(data))
+                        print(f"File content saved to {f.name}")
+                    elif "text" in content:
+                        print(f"{content['text']}")
+                    else:
+                        raise ValueError(
+                            f"Unsupported resource: {content}")
+        elif args.name_or_uri.startswith("prompt/"):
+            # Get prompt
+            result = mcp.get_prompt(args.name_or_uri[7:],
+                                    json.loads(args.args or "{}"))
+            print()
+            if args.raw:
+                print("-> Result:")
+                print(json.dumps(result, indent=4))
+            else:
+                print("-> Result:")
+                for message in result:
+                    content = message["content"]
+                    if content["type"] == "text":
+                        content_s = content["text"]
+                    elif content["type"] == "image" or content["type"] == "audio":
                         extension = mimetypes.guess_extension(
                             content["mimeType"])
-                        if 'blob' in content:
+                        with open(tempfile.mktemp(suffix=extension), "wb") as f:
+                            f.write(b64decode(content["data"]))
+                        content_s = f"<{f.name}>"
+                    elif content["type"] == "resource":
+                        resource = content["resource"]
+                        if 'text' in resource:
+                            content_s = resource["text"]
+                        elif 'blob' in resource:
+                            extension = mimetypes.guess_extension(
+                                resource["mimeType"])
                             with open(tempfile.mktemp(suffix=extension), "wb") as f:
-                                data = content.get(
-                                    "text", b64decode(content["blob"]))
+                                data = resource.get(
+                                    "text", b64decode(resource["blob"]))
                                 f.write(b64decode(data))
-                            print(f"File content saved to {f.name}")
-                        elif "text" in content:
-                            print(f"{content['text']}")
-                        else:
-                            raise ValueError(
-                                f"Unsupported resource: {content}")
-            elif args.name_or_uri.startswith("prompt/"):
-                # Get prompt
-                result = mcp.get_prompt(args.name_or_uri[7:],
-                                        json.loads(args.args or "{}"))
-                print()
-                if args.raw:
-                    print("-> Result:")
-                    print(json.dumps(result, indent=4))
-                else:
-                    print("-> Result:")
-                    for message in result:
-                        content = message["content"]
-                        if content["type"] == "text":
-                            content_s = content["text"]
-                        elif content["type"] == "image" or content["type"] == "audio":
-                            extension = mimetypes.guess_extension(
-                                content["mimeType"])
-                            with open(tempfile.mktemp(suffix=extension), "wb") as f:
-                                f.write(b64decode(content["data"]))
                             content_s = f"<{f.name}>"
-                        elif content["type"] == "resource":
-                            resource = content["resource"]
-                            if 'text' in resource:
-                                content_s = resource["text"]
-                            elif 'blob' in resource:
-                                extension = mimetypes.guess_extension(
-                                    resource["mimeType"])
-                                with open(tempfile.mktemp(suffix=extension), "wb") as f:
-                                    data = resource.get(
-                                        "text", b64decode(resource["blob"]))
-                                    f.write(b64decode(data))
-                                content_s = f"<{f.name}>"
-                            else:
-                                content_s = f"<{resource['uri']}>"
                         else:
-                            raise NotImplementedError
-                        print(f"{message['role']}: {content_s}")
+                            content_s = f"<{resource['uri']}>"
+                    else:
+                        raise NotImplementedError
+                    print(f"{message['role']}: {content_s}")
+        else:
+            # Call tool
+            result = mcp.call_tool(args.name_or_uri,
+                                   json.loads(args.args or "{}"))
+            print()
+            if args.raw:
+                print("-> Result:")
+                print(json.dumps(result, indent=4))
             else:
-                # Call tool
-                result = mcp.call_tool(args.name_or_uri,
-                                       json.loads(args.args or "{}"))
-                print()
-                if args.raw:
-                    print("-> Result:")
-                    print(json.dumps(result, indent=4))
-                else:
-                    print("-> Result:")
-                    for content in result:
-                        if content["type"] == "text":
-                            print(content['text'])
-                        elif content["type"] == "image" or content["type"] == "audio":
+                print("-> Result:")
+                for content in result:
+                    if content["type"] == "text":
+                        print(content['text'])
+                    elif content["type"] == "image" or content["type"] == "audio":
+                        extension = mimetypes.guess_extension(
+                            content["mimeType"])
+                        with open(tempfile.mktemp(suffix=extension), "wb") as f:
+                            f.write(b64decode(content["data"]))
+                        print(f"File content saved to {f.name}")
+                    elif content["type"] == "resource":
+                        resource = content["resource"]
+                        if 'text' in resource:
+                            print(resource["text"])
+                        elif 'blob' in resource:
                             extension = mimetypes.guess_extension(
-                                content["mimeType"])
+                                resource["mimeType"])
                             with open(tempfile.mktemp(suffix=extension), "wb") as f:
-                                f.write(b64decode(content["data"]))
-                            print(f"File content saved to {f.name}")
-                        elif content["type"] == "resource":
-                            resource = content["resource"]
-                            if 'text' in resource:
-                                print(resource["text"])
-                            elif 'blob' in resource:
-                                extension = mimetypes.guess_extension(
-                                    resource["mimeType"])
-                                with open(tempfile.mktemp(suffix=extension), "wb") as f:
-                                    data = resource.get(
-                                        "text", b64decode(resource["blob"]))
-                                    f.write(b64decode(data))
-                                print(f"Resource content saved to {f.name}")
-                            else:
-                                print("Resource:", resource['uri'])
+                                data = resource.get(
+                                    "text", b64decode(resource["blob"]))
+                                f.write(b64decode(data))
+                            print(f"Resource content saved to {f.name}")
                         else:
-                            raise NotImplementedError
+                            print("Resource:", resource['uri'])
+                    else:
+                        raise NotImplementedError
 
             if args.output:
                 with args.output.open("w") as f:
                     json.dump(result, f, indent=4)
-                print(f"Results written to {args.output}")
-
-    if args.output:
-        json.dump(all_results, args.output.open("w"), indent=4)
-        print(f"Results written to {args.output}")
+                print(f"Result written to {args.output}")
