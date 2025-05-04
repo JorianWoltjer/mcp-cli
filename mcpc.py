@@ -17,19 +17,25 @@ class SSE:
         r = requests.get(url, stream=True, **kwargs)
         self.iter = r.iter_lines()
 
+    def get_line(self):
+        line = next(self.iter).split(b":", 1)
+        if len(line) == 1:
+            raise ValueError(f"Missing colon separator: {line!r}")
+        name, value = line[0], line[1].lstrip()
+        return name, value
+
     def __next__(self):
         while True:
-            line = next(self.iter).split(b": ", 1)
-            if len(line) == 1:
-                raise ValueError(f"Missing colon separator: {line!r}")
-            name, value = line
-            if name == b"" and "ping" in value:
+            name, value = self.get_line()
+            # Skip pings
+            if name == b"" and b"ping" in value:
                 assert next(self.iter) == b""
                 continue
 
+            # Return event and data
             if name == b"event":
                 event = value.decode("utf-8")
-                name, value = next(self.iter).split(b": ", 1)
+                name, value = self.get_line()
                 assert name == b"data"
                 data = value.decode("utf-8")
                 assert next(self.iter) == b""
@@ -37,11 +43,10 @@ class SSE:
 
 
 class MCP:
-    def __init__(self, host: str, timeout: int = 10):
+    def __init__(self, host: str, timeout: int = 10, verify: bool = True):
         self.host = host
-        self.sse = SSE(host + '/sse', timeout=timeout)
-        # self.sse.decoder = codecs.getincrementaldecoder(
-        #     "utf-8")(errors='replace')
+        self.verify = verify
+        self.sse = SSE(host + '/sse', timeout=timeout, verify=verify)
         event, data = next(self.sse)
         assert event == "endpoint", f"Received {(event, data)}"
         self.messages_url = urljoin(self.host, data)
@@ -77,7 +82,7 @@ class MCP:
         if not notification:  # notifications are recognized by the absence of an ID
             payload["id"] = 1
 
-        r = requests.post(self.messages_url, json=payload)
+        r = requests.post(self.messages_url, json=payload, verify=self.verify)
         assert r.ok, r.text
 
         if not notification:  # notifications don't have a response
@@ -195,12 +200,12 @@ class MCP:
         return result
 
 
-def get_mcp_info(host):
+def get_mcp_info(host, **kwargs):
     """
     Get MCP server information.
     """
     try:
-        mcp = MCP(host)
+        mcp = MCP(host, **kwargs)
         tools = mcp.list_tools()
         resources = mcp.list_resources()
         prompts = mcp.list_prompts()
@@ -213,7 +218,6 @@ def get_mcp_info(host):
             "prompts": prompts
         }
     except Exception as e:
-        traceback.print_exc()
         return {
             "host": host,
             "success": False,
@@ -239,9 +243,11 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--raw", action="store_true",
                         help="Print raw JSON response")
     parser.add_argument("-t", "--timeout", type=int, default=10,
-                        help="Timeout for requests in seconds")
+                        help="Timeout for requests in seconds, 0 for no timeout (default: %(default)s)")
     parser.add_argument("-T", "--threads", type=int, default=10,
-                        help="Number of threads to use for concurrent requests")
+                        help="Number of threads to use for concurrent requests (default: %(default)s)")
+    parser.add_argument("-k", "--insecure", action="store_true",
+                        help="Ignore SSL certificate errors")
 
     args = parser.parse_args()
 
@@ -249,15 +255,19 @@ if __name__ == "__main__":
         hosts = args.file.read_text().splitlines()
     else:
         hosts = [args.host]
-    hosts = ["http://" +
-             host if not host.startswith("http") else host for host in hosts]
+    hosts = ["http://" + host
+             if not host.startswith("http") else host for host in hosts]
+    if args.insecure:
+        requests.packages.urllib3.disable_warnings()
+    if args.timeout == 0:
+        args.timeout = None
 
     if not args.name_or_uri:
         # List tools/resources/prompts
         all_results = []
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            future_to_host = {executor.submit(
-                get_mcp_info, host): host for host in hosts}
+            future_to_host = {executor.submit(get_mcp_info, host, timeout=args.timeout, verify=not args.insecure): host
+                              for host in hosts}
 
             for future in as_completed(future_to_host):
                 host = future_to_host[future]
@@ -334,16 +344,13 @@ if __name__ == "__main__":
             print(f"Results written to {args.output}")
     else:
         # Call tool/prompt/resource
-        mcp = MCP(args.host, timeout=args.timeout)
+        mcp = MCP(hosts[0], timeout=args.timeout)
         if "://" in args.name_or_uri:
             # Fetch resource
             result = mcp.get_resource(args.name_or_uri)
-            print()
             if args.raw:
-                print("-> Result:")
                 print(json.dumps(result, indent=4))
             else:
-                print("-> Result:")
                 for content in result:
                     extension = mimetypes.guess_extension(
                         content["mimeType"])
@@ -362,12 +369,9 @@ if __name__ == "__main__":
             # Get prompt
             result = mcp.get_prompt(args.name_or_uri[7:],
                                     json.loads(args.args or "{}"))
-            print()
             if args.raw:
-                print("-> Result:")
                 print(json.dumps(result, indent=4))
             else:
-                print("-> Result:")
                 for message in result:
                     content = message["content"]
                     if content["type"] == "text":
@@ -399,12 +403,9 @@ if __name__ == "__main__":
             # Call tool
             result = mcp.call_tool(args.name_or_uri,
                                    json.loads(args.args or "{}"))
-            print()
             if args.raw:
-                print("-> Result:")
                 print(json.dumps(result, indent=4))
             else:
-                print("-> Result:")
                 for content in result:
                     if content["type"] == "text":
                         print(content['text'])
